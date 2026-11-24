@@ -1,0 +1,13 @@
+[package]
+name = "litraglow"
+version = "0.1.0"
+edition = "2024"
+description = "Menu bar controller for the Logitech Litra Glow"
+license = "MIT"
+
+[dependencies]
+litra = { version = "3.3.0", default-features = false }
+objc2 = "0.6.5"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-service-management = "0.3.2"
