@@ -1,6 +1,6 @@
 //! The menu bar item and its menu (native AppKit, built with objc2).
 
-use crate::device::{Cmd, Info, Slot, Snapshot};
+use crate::device::{Cmd, Info, Problem, Slot, Snapshot};
 use crate::mapping::{self, Range};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -29,6 +29,7 @@ const DEFAULT_KELVIN: Range = (2700, 6500);
 struct Ui {
     status_item: Retained<NSStatusItem>,
     header: Retained<NSMenuItem>,
+    detail: Retained<NSMenuItem>,
     power: Retained<NSSwitch>,
     brightness: Retained<NSSlider>,
     brightness_value: Retained<NSTextField>,
@@ -172,7 +173,7 @@ impl Controller {
     fn apply(&self, snapshot: Snapshot) {
         let ui = self.ui();
         match snapshot {
-            Some(Info {
+            Ok(Info {
                 name,
                 on,
                 lumen,
@@ -180,6 +181,7 @@ impl Controller {
                 lumen_range,
                 kelvin_range,
             }) => {
+                ui.detail.setHidden(true);
                 self.ivars().lumen_range.set(lumen_range);
                 self.ivars().kelvin_range.set(kelvin_range);
                 ui.header.setTitle(&NSString::from_str(&name));
@@ -198,14 +200,31 @@ impl Controller {
                 set_enabled(ui, true);
                 self.update_icon(Some(on));
             }
-            None => {
-                ui.header
-                    .setTitle(&NSString::from_str("No Litra light found"));
+            Err(problem) => {
+                let (title, detail) = match problem {
+                    Problem::NotFound => (
+                        "No Litra light found",
+                        "Check the USB cable and port".to_string(),
+                    ),
+                    Problem::Failed(msg) => ("Can't talk to the light", short(&msg)),
+                };
+                ui.header.setTitle(&NSString::from_str(title));
+                ui.detail.setTitle(&NSString::from_str(&detail));
+                ui.detail.setHidden(false);
                 set_enabled(ui, false);
                 self.update_icon(None);
             }
         }
     }
+}
+
+/// Menu titles don't wrap, so keep error details to one line.
+fn short(msg: &str) -> String {
+    let mut s: String = msg.chars().take(48).collect();
+    if msg.chars().count() > 48 {
+        s.push('…');
+    }
+    s
 }
 
 fn set_enabled(ui: &Ui, enabled: bool) {
@@ -357,6 +376,10 @@ pub fn run(
     header.setTitle(&NSString::from_str("Looking for light…"));
     header.setEnabled(false);
     menu.addItem(&header);
+    let detail = NSMenuItem::new(mtm);
+    detail.setEnabled(false);
+    detail.setHidden(true);
+    menu.addItem(&detail);
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
     let (power_item, power) = power_row(mtm, &controller);
@@ -396,6 +419,7 @@ pub fn run(
     let ui = Ui {
         status_item,
         header,
+        detail,
         power,
         brightness,
         brightness_value,

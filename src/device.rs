@@ -33,8 +33,16 @@ pub struct Info {
     pub kelvin_range: Range,
 }
 
-/// `None` means no light is reachable.
-pub type Snapshot = Option<Info>;
+/// Why no light is usable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Problem {
+    /// macOS lists no Litra HID device (unplugged, bad cable/port, no power).
+    NotFound,
+    /// A device is listed but talking to it failed (e.g. missing permission).
+    Failed(String),
+}
+
+pub type Snapshot = Result<Info, Problem>;
 
 /// Latest unconsumed snapshot, shared with the UI thread.
 pub type Slot = Arc<Mutex<Option<Snapshot>>>;
@@ -98,40 +106,53 @@ impl<N: Fn()> Worker<N> {
     }
 
     fn process(&mut self, batch: &Batch) {
+        let mut problem = Problem::NotFound;
         // One retry: the cached handle may be stale after an unplug/replug.
         for _ in 0..2 {
-            if self.handle.is_none() && !self.connect() {
+            if self.handle.is_none()
+                && let Err(p) = self.connect()
+            {
+                problem = p;
                 break;
             }
             let handle = self.handle.as_ref().expect("connected above");
             match apply(handle, batch) {
                 Ok(info) => {
                     if let Some(info) = info {
-                        self.publish(Some(info));
+                        self.publish(Ok(info));
                     }
                     return;
                 }
-                Err(_) => self.handle = None,
+                Err(e) => {
+                    problem = Problem::Failed(e.to_string());
+                    self.handle = None;
+                }
             }
         }
-        self.publish(None);
+        eprintln!("litraglow: {problem:?}");
+        self.publish(Err(problem));
     }
 
-    fn connect(&mut self) -> bool {
+    fn connect(&mut self) -> Result<(), Problem> {
         if self.ctx.is_none() {
-            self.ctx = Litra::new().ok();
+            self.ctx = Some(Litra::new().map_err(|e| Problem::Failed(e.to_string()))?);
         }
-        let Some(ctx) = self.ctx.as_mut() else {
-            return false;
-        };
-        if ctx.refresh_connected_devices().is_err() {
-            return false;
+        let ctx = self.ctx.as_mut().expect("set above");
+        ctx.refresh_connected_devices()
+            .map_err(|e| Problem::Failed(e.to_string()))?;
+        let mut first_error = None;
+        for device in ctx.get_connected_devices() {
+            match device.open(ctx) {
+                Ok(handle) => {
+                    self.handle = Some(handle);
+                    return Ok(());
+                }
+                Err(e) => {
+                    first_error.get_or_insert(e.to_string());
+                }
+            }
         }
-        let handle = ctx
-            .get_connected_devices()
-            .find_map(|device| device.open(ctx).ok());
-        self.handle = handle;
-        self.handle.is_some()
+        Err(first_error.map_or(Problem::NotFound, Problem::Failed))
     }
 
     fn publish(&self, snapshot: Snapshot) {
