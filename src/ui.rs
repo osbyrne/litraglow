@@ -3,20 +3,21 @@
 use crate::device::{Cmd, Info, Problem, Slot, Snapshot};
 use crate::mapping::{self, Range};
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, Message};
 use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSColor, NSControlStateValueOff,
-    NSControlStateValueOn, NSFont, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSSlider,
-    NSStatusBar, NSStatusItem, NSSwitch, NSTextAlignment, NSTextField, NSVariableStatusItemLength,
-    NSView,
+    NSControlStateValueOn, NSEvent, NSFont, NSImage, NSMenu, NSMenuDidBeginTrackingNotification,
+    NSMenuDidEndTrackingNotification, NSMenuItem, NSSlider, NSStatusBar, NSStatusItem, NSSwitch,
+    NSTextAlignment, NSTextField, NSVariableStatusItemLength, NSView,
 };
 use objc2_foundation::{
-    NSBundle, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoopCommonModes, NSSize, NSString,
+    NSBundle, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSPoint, NSRect,
+    NSRunLoopCommonModes, NSSize, NSString,
 };
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::mpsc::Sender;
 
 const MENU_WIDTH: f64 = 250.0;
@@ -31,9 +32,10 @@ struct Ui {
     header: Retained<NSMenuItem>,
     detail: Retained<NSMenuItem>,
     power: Retained<NSSwitch>,
-    brightness: Retained<NSSlider>,
+    // Replaced with fresh sliders whenever the menu closes; see `menuDidEndTracking:`.
+    brightness: RefCell<Retained<NSSlider>>,
     brightness_value: Retained<NSTextField>,
-    warmth: Retained<NSSlider>,
+    warmth: RefCell<Retained<NSSlider>>,
     warmth_value: Retained<NSTextField>,
     login: Retained<NSMenuItem>,
 }
@@ -55,17 +57,31 @@ define_class!(
 
     unsafe impl NSObjectProtocol for Controller {}
 
-    unsafe impl NSMenuDelegate for Controller {
+    // Menu open/close are observed through NSMenu's tracking notifications
+    // rather than NSMenuDelegate: on current macOS a status item's menu never
+    // calls its delegate's menuWillOpen:/menuDidClose:.
+    impl Controller {
         /// Re-read the light every time the menu opens, so changes made with
         /// its physical buttons (or a hot-plug) are reflected.
-        #[unsafe(method(menuWillOpen:))]
-        fn menu_will_open(&self, _menu: &NSMenu) {
+        #[unsafe(method(menuDidBeginTracking:))]
+        fn menu_did_begin_tracking(&self, _note: &NSNotification) {
             let _ = self.ivars().tx.send(Cmd::Refresh);
             self.sync_login_item();
         }
-    }
 
-    impl Controller {
+        /// If the menu closes while a slider is being dragged (Escape, a click
+        /// elsewhere, the mouse released outside the menu), the slider never
+        /// sees the mouse-up. On recent macOS, where `NSSlider` is backed by a
+        /// SwiftUI host, it then ignores later drags, even after the menu is
+        /// reopened. A fresh slider has no such leftover state, so swap both in
+        /// while the menu is closed.
+        #[unsafe(method(menuDidEndTracking:))]
+        fn menu_did_end_tracking(&self, _note: &NSNotification) {
+            let ui = self.ui();
+            renew_slider(&ui.brightness);
+            renew_slider(&ui.warmth);
+        }
+
         #[unsafe(method(togglePower:))]
         fn toggle_power(&self, sender: &NSSwitch) {
             let on = sender.state() == NSControlStateValueOn;
@@ -190,13 +206,17 @@ impl Controller {
                 } else {
                     NSControlStateValueOff
                 });
-                let brightness = mapping::fraction_from_lumen(lumen_range, lumen);
-                ui.brightness.setDoubleValue(brightness);
-                ui.brightness_value
-                    .setStringValue(&percent_label(brightness));
-                let warmth = mapping::warmth_from_kelvin(kelvin_range, kelvin);
-                ui.warmth.setDoubleValue(warmth);
-                ui.warmth_value.setStringValue(&kelvin_label(kelvin));
+                // Moving a slider under a held mouse button fights the drag
+                // (and can wedge the slider); the drag's own writes win anyway.
+                if NSEvent::pressedMouseButtons() & 1 == 0 {
+                    let brightness = mapping::fraction_from_lumen(lumen_range, lumen);
+                    ui.brightness.borrow().setDoubleValue(brightness);
+                    ui.brightness_value
+                        .setStringValue(&percent_label(brightness));
+                    let warmth = mapping::warmth_from_kelvin(kelvin_range, kelvin);
+                    ui.warmth.borrow().setDoubleValue(warmth);
+                    ui.warmth_value.setStringValue(&kelvin_label(kelvin));
+                }
                 set_enabled(ui, true);
                 self.update_icon(Some(on));
             }
@@ -229,8 +249,8 @@ fn short(msg: &str) -> String {
 
 fn set_enabled(ui: &Ui, enabled: bool) {
     ui.power.setEnabled(enabled);
-    ui.brightness.setEnabled(enabled);
-    ui.warmth.setEnabled(enabled);
+    ui.brightness.borrow().setEnabled(enabled);
+    ui.warmth.borrow().setEnabled(enabled);
 }
 
 fn percent_label(fraction: f64) -> Retained<NSString> {
@@ -294,16 +314,7 @@ fn slider_row(
         true,
     );
 
-    let slider = unsafe {
-        NSSlider::sliderWithValue_minValue_maxValue_target_action(
-            0.5,
-            0.0,
-            1.0,
-            Some(target.as_ref()),
-            Some(action),
-            mtm,
-        )
-    };
+    let slider = new_slider(mtm, target.as_ref(), action, 0.5);
     slider.setFrame(rect(PAD, 6.0, inner, 20.0));
 
     view.addSubview(&title);
@@ -312,6 +323,41 @@ fn slider_row(
     let item = NSMenuItem::new(mtm);
     item.setView(Some(&view));
     (item, slider, value)
+}
+
+fn new_slider(
+    mtm: MainThreadMarker,
+    target: &AnyObject,
+    action: objc2::runtime::Sel,
+    value: f64,
+) -> Retained<NSSlider> {
+    unsafe {
+        NSSlider::sliderWithValue_minValue_maxValue_target_action(
+            value,
+            0.0,
+            1.0,
+            Some(target),
+            Some(action),
+            mtm,
+        )
+    }
+}
+
+/// Replaces `cell`'s slider in its view with an identical, fresh one.
+fn renew_slider(cell: &RefCell<Retained<NSSlider>>) {
+    let old = cell.borrow().clone();
+    let mtm = old.mtm();
+    let (Some(superview), Some(target), Some(action)) =
+        // SAFETY: the slider row view stays alive (owned by its menu item).
+        (unsafe { old.superview() }, old.target(), old.action())
+    else {
+        return;
+    };
+    let new = new_slider(mtm, &target, action, old.doubleValue());
+    new.setFrame(old.frame());
+    new.setEnabled(old.isEnabled());
+    superview.replaceSubview_with(&old, &new);
+    *cell.borrow_mut() = new;
 }
 
 fn power_row(
@@ -370,7 +416,23 @@ pub fn run(
 
     let menu = NSMenu::new(mtm);
     menu.setAutoenablesItems(false);
-    menu.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
+    let center = NSNotificationCenter::defaultCenter();
+    for (name, action) in [
+        (
+            unsafe { NSMenuDidBeginTrackingNotification },
+            sel!(menuDidBeginTracking:),
+        ),
+        (
+            unsafe { NSMenuDidEndTrackingNotification },
+            sel!(menuDidEndTracking:),
+        ),
+    ] {
+        // SAFETY: the controller lives for the whole app run, so it outlives
+        // its registration; the selectors take one NSNotification argument.
+        unsafe {
+            center.addObserver_selector_name_object(&controller, action, Some(name), Some(&menu));
+        }
+    }
 
     let header = NSMenuItem::new(mtm);
     header.setTitle(&NSString::from_str("Looking for light…"));
@@ -421,9 +483,9 @@ pub fn run(
         header,
         detail,
         power,
-        brightness,
+        brightness: RefCell::new(brightness),
         brightness_value,
-        warmth,
+        warmth: RefCell::new(warmth),
         warmth_value,
         login,
     };
